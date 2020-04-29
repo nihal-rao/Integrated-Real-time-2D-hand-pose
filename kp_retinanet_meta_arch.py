@@ -73,7 +73,7 @@ class KPRetinaNet(nn.Module):
         self.topk_candidates          = cfg.MODEL.RETINANET.TOPK_CANDIDATES_TEST
         self.nms_threshold            = cfg.MODEL.RETINANET.NMS_THRESH_TEST
         self.max_detections_per_image = cfg.TEST.DETECTIONS_PER_IMAGE
-        self.num_keypoint_candidates = 10
+        self.num_keypoint_candidates = 10 #@nihal for a given image, max number of predicted bboxes per feature level to pass onto kp head.
         # Vis parameters
         self.vis_period               = cfg.VIS_PERIOD
         self.input_format             = cfg.INPUT.FORMAT
@@ -182,13 +182,18 @@ class KPRetinaNet(nn.Module):
         if self.training:
             gt_classes, gt_anchors_reg_deltas = self.get_ground_truth(anchors, gt_instances)
             losses = self.losses(gt_classes, gt_anchors_reg_deltas, box_cls, box_delta)
-            pred_kp_bboxes,kp_img_ids = self.transform_delta_to_bbox(box_cls,box_delta,anchors,gt_classes,images.image_sizes)
+            pred_kp_bboxes,kp_img_ids = self.transform_delta_to_bbox(box_cls,box_delta,anchors,gt_classes,images.image_sizes) #@nihal,filtering predicted bboxes.
             if len(kp_img_ids)>0:
-                keypoint_feature_map = {}
-                keypoint_gt_instances = [gt_instances[k] for k in kp_img_ids]
-                keypoint_feature_map['kp_map'] = kp_map[kp_img_ids]
-                keypoint_losses = self.roi_kp_head(images, keypoint_feature_map, pred_kp_bboxes, keypoint_gt_instances)
-                losses.update(keypoint_losses)
+                """
+                kp_img_ids contains contains the indexes ( [0,N), N=batchsize ) of the images 
+                which have atleast one predicted bbox belonging to the foreground 
+                with score greater than the threshold specified in transform_deltas_to_bbox
+                """
+                keypoint_feature_map = {} 
+                keypoint_gt_instances = [gt_instances[k] for k in kp_img_ids] 
+                keypoint_feature_map['kp_map'] = kp_map[kp_img_ids] 
+                keypoint_losses = self.roi_kp_head(images, keypoint_feature_map, pred_kp_bboxes, keypoint_gt_instances) #@nihal,forward to kp head
+                losses.update(keypoint_losses) 
             
             if self.vis_period > 0:
                 storage = get_event_storage()
@@ -197,13 +202,13 @@ class KPRetinaNet(nn.Module):
                     self.visualize_training(batched_inputs, results)
             return losses
         else:
-            pred_kp_bboxes,kp_img_ids = self.inference_mod(box_cls, box_delta, anchors, images.image_sizes)
+            pred_kp_bboxes,kp_img_ids = self.inference_mod(box_cls, box_delta, anchors, images.image_sizes) #@nihal, filter bboxes
             processed_results = []
             if len(kp_img_ids)>0:
                 keypoint_feature_map = {}
                 keypoint_feature_map['kp_map'] = kp_map[kp_img_ids]
-                pred_kps = self.roi_kp_head(images, keypoint_feature_map, pred_kp_bboxes)
-                for i,idx in enumerate(kp_img_ids):
+                pred_kps = self.roi_kp_head(images, keypoint_feature_map, pred_kp_bboxes) #@nihal, forward pred boxes to kp head
+                for i,idx in enumerate(kp_img_ids):#@nihal , post process results per image
                     image_size = images.image_sizes[idx]
                     input_per_image = batched_inputs[idx]
                     height = input_per_image.get("height", image_size[0])
@@ -326,7 +331,23 @@ class KPRetinaNet(nn.Module):
 
     @torch.no_grad()
     def transform_delta_to_bbox(self,box_cls,box_delta,anchors,gt_classes,image_sizes,threshold=0):
-
+        """
+        #@nihal
+        Selects bboxes to be passed onto the kp head. Used only in training.
+        args:
+        box_cls,box_delta,anchors,gt_classes,image_sizes:See inference() and get_ground_truth()
+        threshold - score threshold on predicted bboxes, foreground bboxes above this threshold are selected.
+        
+        Returns:
+        results (List[Instances]) - a list of M instances with fields proposal_boxes and objectness_logits.
+        kp_img_ids - a list of length M containing indices of positive images(images which have atleast one predicted
+                        bbox greater than threshold and belonging to foreground).
+        M is the number of such positive images in a batch.
+        When there are no positive images at all, empty lists are returned.
+        Similar to inference() with the following differences:
+            transform_delta_to_bbox() returns kp_img_ids - inference() does not.
+            transform_delta_to_bbox() returns empty list when there are no positive images.
+        """
         results = []
         kp_img_ids = []
         box_cls = [permute_to_N_HWA_K(x, self.num_classes) for x in box_cls]
@@ -345,37 +366,87 @@ class KPRetinaNet(nn.Module):
             results.append(results_per_image)
             kp_img_ids.append(img_idx)
         return results,kp_img_ids
-
-    def inference(self, box_cls, box_delta, anchors, image_sizes):
+    
+    def transform_deltas_to_bbox_per_image(self, box_cls, box_delta, anchors, gt_classes, image_size, threshold):
         """
+        @nihal
+        Single-image inference. Return bounding-box detection results by thresholding
+        on scores and applying non-maximum suppression (NMS). Used while training.
         Arguments:
-            box_cls, box_delta: Same as the output of :meth:`RetinaNetHead.forward`
-            anchors (list[list[Boxes]]): a list of #images elements. Each is a
-                list of #feature level Boxes. The Boxes contain anchors of this
-                image on the specific feature level.
-            image_sizes (List[torch.Size]): the input image sizes
+            box_cls (list[Tensor]): list of #feature levels. Each entry contains
+                tensor of size (H x W x A, K)
+            box_delta (list[Tensor]): Same shape as 'box_cls' except that K becomes 4.
+            anchors (list[Boxes]): list of #feature levels. Each entry contains
+                a Boxes object, which contains all the anchors for that
+                image in that feature level.
+             gt_classes (Tensor) : vector of ground truth classes for a single image, for all anchors
+             at all feature map levels .
+            image_size (tuple(H, W)): a tuple of the image height and width.
         Returns:
-            results (List[Instances]): a list of #images elements.
+            a single Instance object, containing foreground boxes above threshold.
+            If no boxes aboves threshold , returns -1.
         """
-        assert len(anchors) == len(image_sizes)
-        results = []
+        boxes_all = []
+        scores_all = []
+        class_idxs_all = []
 
-        box_cls = [permute_to_N_HWA_K(x, self.num_classes) for x in box_cls]
-        box_delta = [permute_to_N_HWA_K(x, 4) for x in box_delta]
-        # list[Tensor], one per level, each has shape (N, Hi x Wi x A, K or 4)
+        start_id = 0
+        end_id = 0
+        # Iterate over every feature level
+        for box_cls_i, box_reg_i, anchors_i in zip(box_cls, box_delta, anchors):
+            # (HxWxAxK,)
+          
+            box_cls_i = box_cls_i.flatten().sigmoid_()
 
-        for img_idx, anchors_per_image in enumerate(anchors):
-            image_size = image_sizes[img_idx]
-            box_cls_per_image = [box_cls_per_level[img_idx] for box_cls_per_level in box_cls]
-            box_reg_per_image = [box_reg_per_level[img_idx] for box_reg_per_level in box_delta]
-            results_per_image = self.inference_single_image(
-                box_cls_per_image, box_reg_per_image, anchors_per_image, tuple(image_size)
-            )
-            results.append(results_per_image)
-        return results
+            num_box_per_level = box_cls_i.size(0)
+            end_id = end_id+num_box_per_level
+            gt_classes_i = gt_classes[start_id:end_id]
+            start_id = end_id
+            valid_idxs = (gt_classes_i!=self.num_classes)&(gt_classes_i!=-1)#@nihal, ensuring only foreground bboxes are filtered.
+            
+            box_cls_i = box_cls_i[valid_idxs]
+            box_reg_i = box_reg_i[valid_idxs]
+            anchors_i = anchors_i[valid_idxs]
+            # Keep top k top scoring indices only.
+            num_topk = min(self.num_keypoint_candidates, box_reg_i.size(0))
+            if num_topk == 0:
+                continue
+            # torch.sort is actually faster than .topk (at least on GPUs)
+            predicted_prob, topk_idxs = box_cls_i.sort(descending=True)
+            predicted_prob = predicted_prob[:num_topk]
+            topk_idxs = topk_idxs[:num_topk]
+
+            # filter out the proposals with low confidence score
+            keep_idxs = predicted_prob > threshold
+            predicted_prob = predicted_prob[keep_idxs]
+            if predicted_prob.size(0)==0:
+                continue
+            topk_idxs = topk_idxs[keep_idxs]
+
+            anchor_idxs = topk_idxs // self.num_classes
+            classes_idxs = topk_idxs % self.num_classes
+
+            box_reg_i = box_reg_i[anchor_idxs]
+            anchors_i = anchors_i[anchor_idxs]
+            # predict boxes
+            predicted_boxes = self.box2box_transform.apply_deltas(box_reg_i, anchors_i.tensor)
+            boxes_all.append(predicted_boxes)
+            scores_all.append(predicted_prob)
+            class_idxs_all.append(classes_idxs)
+
+        if len(boxes_all) ==0:
+          return -1
+        boxes_all, scores_all, class_idxs_all = [
+            cat(x) for x in [boxes_all, scores_all, class_idxs_all]
+        ]
+        result = Instances(image_size)
+        result.proposal_boxes = Boxes(boxes_all)
+        result.objectness_logits = scores_all
+        return result
     
     def inference_mod(self, box_cls, box_delta, anchors, image_sizes):
         """
+        #@nihal
         Arguments:
             box_cls, box_delta: Same as the output of :meth:`RetinaNetHead.forward`
             anchors (list[list[Boxes]]): a list of #images elements. Each is a
@@ -383,7 +454,14 @@ class KPRetinaNet(nn.Module):
                 image on the specific feature level.
             image_sizes (List[torch.Size]): the input image sizes
         Returns:
-            results (List[Instances]): a list of #images elements.
+            results (List[Instances]) - a list of M instances with fields proposal_boxes and objectness_logits.
+            kp_img_ids - a list of length M containing indices of positive images(images which have atleast one predicted
+                        bbox greater than threshold).
+            M is the number of such positive images in a batch.
+            When there are no positive images at all, empty lists are returned.
+        Similar to inference() with the following differences:
+        inference_mod() returns kp_img_ids - inference() does not.
+        inference_mod() returns empty list when there are no positive images.
         """
         assert len(anchors) == len(image_sizes)
         results = []
@@ -408,6 +486,7 @@ class KPRetinaNet(nn.Module):
 
     def inference_single_image_mod(self, box_cls, box_delta, anchors, image_size):
         """
+        #@nihal
         Single-image inference. Return bounding-box detection results by thresholding
         on scores and applying non-maximum suppression (NMS).
         Arguments:
@@ -419,7 +498,11 @@ class KPRetinaNet(nn.Module):
                 image in that feature level.
             image_size (tuple(H, W)): a tuple of the image height and width.
         Returns:
-            Same as `inference`, but for only one image.
+             a single Instance object, containing foreground boxes above threshold.
+            If no boxes aboves threshold , returns -1.  
+        The main difference between this function and inference_single_image()
+        is that inference_single_image_mod() skips the feature level if 
+        no bboxes above the score threshold are found.
         """
         boxes_all = []
         scores_all = []
@@ -469,7 +552,49 @@ class KPRetinaNet(nn.Module):
         result.scores = scores_all[keep]
         result.pred_classes = class_idxs_all[keep]
         return result
+ 
+    def preprocess_image(self, batched_inputs):
+        """
+        Normalize, pad and batch the input images.
+        """
+        images = [x["image"].to(self.device) for x in batched_inputs]
+        images = [(x - self.pixel_mean) / self.pixel_std for x in images]
+        images = ImageList.from_tensors(images, self.backbone.size_divisibility)
+        return images
+    
+    """
+    NOTE: The following two functions are not used. They are the original functions 
+    in detectron2 source code and are included only for reference.
+    """
+    
+    def inference(self, box_cls, box_delta, anchors, image_sizes):
+        """
+        Arguments:
+            box_cls, box_delta: Same as the output of :meth:`RetinaNetHead.forward`
+            anchors (list[list[Boxes]]): a list of #images elements. Each is a
+                list of #feature level Boxes. The Boxes contain anchors of this
+                image on the specific feature level.
+            image_sizes (List[torch.Size]): the input image sizes
+        Returns:
+            results (List[Instances]): a list of #images elements.
+        """
+        assert len(anchors) == len(image_sizes)
+        results = []
 
+        box_cls = [permute_to_N_HWA_K(x, self.num_classes) for x in box_cls]
+        box_delta = [permute_to_N_HWA_K(x, 4) for x in box_delta]
+        # list[Tensor], one per level, each has shape (N, Hi x Wi x A, K or 4)
+
+        for img_idx, anchors_per_image in enumerate(anchors):
+            image_size = image_sizes[img_idx]
+            box_cls_per_image = [box_cls_per_level[img_idx] for box_cls_per_level in box_cls]
+            box_reg_per_image = [box_reg_per_level[img_idx] for box_reg_per_level in box_delta]
+            results_per_image = self.inference_single_image(
+                box_cls_per_image, box_reg_per_image, anchors_per_image, tuple(image_size)
+            )
+            results.append(results_per_image)
+        return results
+    
     def inference_single_image(self, box_cls, box_delta, anchors, image_size):
         """
         Single-image inference. Return bounding-box detection results by thresholding
@@ -529,84 +654,3 @@ class KPRetinaNet(nn.Module):
         result.scores = scores_all[keep]
         result.pred_classes = class_idxs_all[keep]
         return result
-
-    def transform_deltas_to_bbox_per_image(self, box_cls, box_delta, anchors, gt_classes, image_size, threshold):
-        """
-        Single-image inference. Return bounding-box detection results by thresholding
-        on scores and applying non-maximum suppression (NMS).
-        Arguments:
-            box_cls (list[Tensor]): list of #feature levels. Each entry contains
-                tensor of size (H x W x A, K)
-            box_delta (list[Tensor]): Same shape as 'box_cls' except that K becomes 4.
-            anchors (list[Boxes]): list of #feature levels. Each entry contains
-                a Boxes object, which contains all the anchors for that
-                image in that feature level.
-            image_size (tuple(H, W)): a tuple of the image height and width.
-        Returns:
-            Same as `inference`, but for only one image.
-        """
-        boxes_all = []
-        scores_all = []
-        class_idxs_all = []
-
-        start_id = 0
-        end_id = 0
-        # Iterate over every feature level
-        for box_cls_i, box_reg_i, anchors_i in zip(box_cls, box_delta, anchors):
-            # (HxWxAxK,)
-            box_cls_i = box_cls_i.flatten().sigmoid_()
-
-            num_box_per_level = box_cls_i.size(0)
-            end_id = end_id+num_box_per_level
-            gt_classes_i = gt_classes[start_id:end_id]
-            start_id = end_id
-            valid_idxs = (gt_classes_i!=self.num_classes)&(gt_classes_i!=-1)
-            
-            box_cls_i = box_cls_i[valid_idxs]
-            box_reg_i = box_reg_i[valid_idxs]
-            anchors_i = anchors_i[valid_idxs]
-            # Keep top k top scoring indices only.
-            num_topk = min(self.num_keypoint_candidates, box_reg_i.size(0))
-            if num_topk == 0:
-                continue
-            # torch.sort is actually faster than .topk (at least on GPUs)
-            predicted_prob, topk_idxs = box_cls_i.sort(descending=True)
-            predicted_prob = predicted_prob[:num_topk]
-            topk_idxs = topk_idxs[:num_topk]
-
-            # filter out the proposals with low confidence score
-            keep_idxs = predicted_prob > threshold
-            predicted_prob = predicted_prob[keep_idxs]
-            if predicted_prob.size(0)==0:
-                continue
-            topk_idxs = topk_idxs[keep_idxs]
-
-            anchor_idxs = topk_idxs // self.num_classes
-            classes_idxs = topk_idxs % self.num_classes
-
-            box_reg_i = box_reg_i[anchor_idxs]
-            anchors_i = anchors_i[anchor_idxs]
-            # predict boxes
-            predicted_boxes = self.box2box_transform.apply_deltas(box_reg_i, anchors_i.tensor)
-            boxes_all.append(predicted_boxes)
-            scores_all.append(predicted_prob)
-            class_idxs_all.append(classes_idxs)
-
-        if len(boxes_all) ==0:
-          return -1
-        boxes_all, scores_all, class_idxs_all = [
-            cat(x) for x in [boxes_all, scores_all, class_idxs_all]
-        ]
-        result = Instances(image_size)
-        result.proposal_boxes = Boxes(boxes_all)
-        result.objectness_logits = scores_all
-        return result
-
-    def preprocess_image(self, batched_inputs):
-        """
-        Normalize, pad and batch the input images.
-        """
-        images = [x["image"].to(self.device) for x in batched_inputs]
-        images = [(x - self.pixel_mean) / self.pixel_std for x in images]
-        images = ImageList.from_tensors(images, self.backbone.size_divisibility)
-        return images
