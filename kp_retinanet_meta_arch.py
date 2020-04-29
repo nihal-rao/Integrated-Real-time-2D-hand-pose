@@ -18,7 +18,9 @@ from detectron2.modeling.meta_arch.retinanet import RetinaNetHead
 
 __all__ = ["KPRetinaNet"]
 
-
+"""
+All modified code is denoted by @#nihal
+"""
 def permute_to_N_HWA_K(tensor, K):
     """
     Transpose/reshape a tensor from (N, (A x K), H, W) to (N, (HxWxA), K)
