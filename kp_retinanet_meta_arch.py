@@ -332,7 +332,7 @@ class KPRetinaNet(nn.Module):
         return torch.stack(gt_classes), torch.stack(gt_anchors_deltas)
 
     @torch.no_grad()
-    def transform_delta_to_bbox(self,box_cls,box_delta,anchors,gt_classes,image_sizes,threshold=0):
+    def transform_delta_to_bbox(self,box_cls,box_delta,anchors,gt_classes,image_sizes,threshold=0.5):
         """
         #@nihal
         Selects bboxes to be passed onto the kp head. Used only in training.
