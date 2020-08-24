@@ -19,7 +19,7 @@ from detectron2.modeling.box_regression import Box2BoxTransform
 from detectron2.modeling.matcher import Matcher
 from detectron2.modeling.meta_arch.retinanet import RetinaNetHead
 
-__all__ = ["NNRetinaNet"]
+__all__ = ["KPRetinaNet"]
 
 
 def permute_to_N_HWA_K(tensor, K):
@@ -68,7 +68,7 @@ def freeze(self):
 	return self
 
 @META_ARCH_REGISTRY.register()
-class NNRetinaNet(nn.Module):
+class KPRetinaNet(nn.Module):
 	"""
 	Implement RetinaNet (https://arxiv.org/abs/1708.02002).
 	"""
@@ -121,17 +121,13 @@ class NNRetinaNet(nn.Module):
 		"""
 		self.loss_normalizer = 100  # initialize with any reasonable #fg that's not too small
 		self.loss_normalizer_momentum = 0.9
-		print("i changes")
+		
 		for p in self.backbone.parameters():
 			p.requires_grad = False
 		FrozenBatchNorm2d.convert_frozen_batchnorm(self.backbone)
 		for p in self.head.parameters():
 			p.requires_grad = False
 		FrozenBatchNorm2d.convert_frozen_batchnorm(self.head)
-		for j in self.head.parameters():
-			if j.requires_grad == True:
-				print("anomaly*************************************************************************************************")
-				break
 		
 
 	@property

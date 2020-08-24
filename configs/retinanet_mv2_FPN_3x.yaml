@@ -1,6 +1,0 @@
-_BASE_: "Base-MV2-RetinaNet.yaml"
-MODEL:
-  WEIGHTS: "https://www.dropbox.com/s/yduxbc13s3ip6qn/mobilenet_v2_detectron2.pth?dl=1"
-SOLVER:
-  STEPS: (210000, 250000)
-  MAX_ITER: 270000
