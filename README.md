@@ -12,7 +12,7 @@ We present an integrated, real-time approach for 2D hand pose detection from a m
 
 The files defining the new architecture can be found in the folder KP_RN_Configs folder.
 
-Models for LSMV and NZSL datasets can be found [here](https://drive.google.com/drive/folders/1TFRtcexID1f9uo-bZC-JqWxMP4XqKdGH?usp=sharing).
+Model weights for LSMV and NZSL datasets can be found [here](https://drive.google.com/drive/folders/1TFRtcexID1f9uo-bZC-JqWxMP4XqKdGH?usp=sharing).
 
 ## Requirements
 * Python 3.6+
