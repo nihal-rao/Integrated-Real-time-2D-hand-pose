@@ -1,5 +1,13 @@
 # An Integrated Method for Realtime 2D Hand Pose Detection
 
+<p align="left">
+  <img width="500" height="500" src="https://github.com/nihal-rao/Integrated-Real-time-2D-hand-pose/blob/master/images/LSMV.png">
+</p>
+
+<p align="left">
+  <img width="500" height="500" src="https://github.com/nihal-rao/Integrated-Real-time-2D-hand-pose/blob/master/images/NZSL_1.png">
+</p>
+
 We present an integrated, real-time approach for 2D hand pose detection from a monocular RGB image, with a common backbone shared between the bounding box detector and the keypoint detector subnets. This is in contrast to traditional methods which use two separate models for hand localization and keypoint detection with no sharing of features. We build on the popular RetinaNet architecture for object detection and introduce an integrated model which performs both hand localization and keypoint detection in real-time. We evaluate our approach on two different datasets and show evidence that our model obtains accurate results.
 
 The files defining the new architecture can be found in the folder KP_RN_Configs folder.
